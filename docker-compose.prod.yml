@@ -1,0 +1,13 @@
+version: "3.9"
+
+services:
+  node-status:
+    build: .
+    networks:
+      - prototypes
+
+networks:
+  prototypes:
+    name: prototypes
+    external: true
+
