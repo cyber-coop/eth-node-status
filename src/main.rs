@@ -2,8 +2,9 @@ use std::{net::TcpStream, time::Duration};
 use byteorder::{BigEndian, ReadBytesExt};
 use std::io::prelude::*;
 use std::net::SocketAddr;
-use std::collections::HashMap;
-use rayon::prelude::*;
+use tokio_postgres::NoTls;
+use secp256k1::{rand, SecretKey};
+use secp256k1::rand::RngCore;
 
 pub mod utils;
 pub mod mac;
@@ -12,15 +13,10 @@ pub mod types;
 pub mod errors;
 pub mod config;
 
-use crate::{errors::{Errors, NodeId}, types::CapabilityMessage};
+use crate::types::CapabilityMessage;
 
-struct NodeInfo {
-    remote_id: Vec<u8>,
-    network_id: u64,
-    capabilities: String,
-}
-
-fn main() {
+#[tokio::main]
+async fn main() {
     println!("Start getting status from nodes");
     let cfg = config::read_config();
 
@@ -37,18 +33,23 @@ fn main() {
         cfg.database.dbname,
     );
 
-    let mut postgres_client = postgres::Client::connect(&database_params, postgres::NoTls).unwrap();
 
-    let records = postgres_client.query("SELECT * FROM discv4.nodes WHERE network_id IS NULL;", &[]).unwrap();
+    let (postgres_client, connection) =
+        tokio_postgres::connect(&database_params, NoTls).await.unwrap();
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {}", e);
+        }
+    });
+
+    let records = postgres_client.query("SELECT * FROM discv4.nodes WHERE network_id IS NULL ORDER BY RANDOM();", &[]).await.unwrap();
 
 
-    let mut trieur: HashMap<u64, u32> = HashMap::new();
-    let mut disconnect_counter = 0;
-    let mut eip8_error_counter = 0;
-    let mut timeout_counter = 0;
-    let mut unreadable_payload_counter = 0;
+    let update_statement = postgres_client.prepare("UPDATE discv4.nodes SET network_id = $1, capabilities = $2 WHERE id = $3;").await.unwrap();
+    let delete_statement = postgres_client.prepare("DELETE FROM discv4.nodes WHERE id = $1;").await.unwrap();
 
-    let result: Vec<Result<NodeInfo, Errors>> = records.par_iter().map(|record| {
+    let _ = futures::future::join_all(records.iter().map(|record| async {
         let ip: String = record.get(0);
         let port: i32 = record.get(1);
         let remote_id: Vec<u8> = record.get(3);
@@ -63,22 +64,23 @@ fn main() {
 
         if stream.is_err() {
             println!("[{}@{}:{}] Couldn't reach node", hex::encode(&remote_id), ip, port);
-
-            return Err(Errors::UnreachableNode(NodeId::new(&remote_id, &ip, port)));
+            let _result = postgres_client.execute(&delete_statement, &[&remote_id]).await.unwrap();
+            return
         }
 
         let mut stream = stream.unwrap();
         // Set read timeout
         stream.set_read_timeout(Some(Duration::from_millis(5000))).unwrap();
 
-        let private_key = hex::decode("472D4B6150645267556B58703273357638792F423F4528482B4D625165546856").unwrap();
-        // Should be generated randomly
-        let nonce = hex::decode("09267e7d55aada87e46468b2838cc616f084394d6d600714b58ad7a3a2c0c870").unwrap();
-        // Epheremal private key (should be random)
-        let ephemeral_privkey = hex::decode("691bb7a2fd6647eae78a235b9d305d09f796fe8e8ce7a18aa1aa1deff9649a02").unwrap();
-        // Pad (should be generated randomly)
-        let pad = hex::decode("eb035e803db3b2dea4a2c724739e7edaecb14ef242f5f4df58386b10626ab4887cc84d9dea153f24526200f4089946f4c4b26c283ac7e923e0c53dd1de83682df2fe44f4fe841c480465b38533e30c373ccb0022b95d722d577828862c9fe7e87e5e730bdecd4f358c7673e0999a06190f03e6d0ca98dae5aae8f16ca81c92").unwrap();
-    
+        let private_key = SecretKey::new(&mut rand::thread_rng())
+        .secret_bytes()
+        .to_vec();
+        let mut nonce = vec![0; 32];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        let ephemeral_privkey = SecretKey::new(&mut rand::thread_rng())
+            .secret_bytes()
+            .to_vec();
+        let pad = vec![0; 100]; // should be generated randomly but we don't really care
         /******************
          * 
         *  Create Auth message (EIP8 supported)
@@ -104,32 +106,19 @@ fn main() {
             // Probably doesn't support EIP8
             // ACTUALLY... no it just have the discovery but no node (maybe someone doing like us)
             println!("[{}@{}:{}] Size expected is 0. Something is wrong.", hex::encode(&remote_id), ip, port);
-            // let sk = k256::ecdsa::SigningKey::from_slice(&ephemeral_privkey).unwrap();
-            // let ephemeral_pubkey = sk.verifying_key().to_encoded_point(false).to_bytes();
-
-            // let init_msg = utils::create_auth_non_eip8(&remote_id, &private_key, &nonce, &ephemeral_privkey, &ephemeral_pubkey.to_vec());
-            // // send the message
-            // println!("Sending NON EIP8 Auth message");
-            // stream.write(&init_msg).unwrap();
-            // stream.flush().unwrap();
-
-            // println!("waiting for answer...");
-            // let mut buf = [0u8; 2];
-            // let _size = stream.read(&mut buf);
+            println!("[{}@{}:{}] EIP8 error", hex::encode(&remote_id), ip, port);
             
-            // let size_expected = buf.as_slice().read_u16::<BigEndian>().unwrap() as usize;
-            // let shared_mac_data = &buf[0..2];
-
-            // dbg!(&size_expected);
-
-            return Err(Errors::EIP8Error(NodeId::new(&remote_id, &ip, port)));
+            let _result = postgres_client.execute(&delete_statement, &[&remote_id]).await.unwrap();
+            return
         }
 
         let mut payload = vec![0u8; size_expected.into()];
         let result = stream.read_exact(&mut payload);
     
         if result.is_err() {
-            return Err(Errors::UnknownError(NodeId::new(&remote_id, &ip, port)));
+            println!("[{}@{}:{}] Unknown error", hex::encode(&remote_id), ip, port);
+            let _result = postgres_client.execute(&delete_statement, &[&remote_id]).await.unwrap();
+            return
         }
 
     
@@ -176,14 +165,14 @@ fn main() {
     
         if uncrypted_body.is_err() {
             println!("[{}@{}:{}] Time out", hex::encode(&remote_id), ip, port);
-            return Err(Errors::TimeOut(NodeId::new(&remote_id, &ip, port)));
+            return
         }
         let uncrypted_body = uncrypted_body.unwrap();
 
         if uncrypted_body[0] == 0x01 {
             // we have a disconnect message unfortunately
             println!("[{}@{}:{}] Disconnect {}", hex::encode(&remote_id), ip, port, hex::encode(uncrypted_body[1..].to_vec()));
-            return Err(Errors::Disconnect(NodeId::new(&remote_id, &ip, port), uncrypted_body[1]));
+            return
         }
 
         // Should be HELLO
@@ -192,7 +181,7 @@ fn main() {
 
         if payload.is_err() {
             println!("[{}@{}:{}] Couldn't read payload", hex::encode(&remote_id), ip, port);
-            return Err(Errors::UnreadablePayload(NodeId::new(&remote_id, &ip, port), uncrypted_body[1..].to_vec()));
+            return 
         }
 
         let hello_message = payload.unwrap();
@@ -245,66 +234,22 @@ fn main() {
         let uncrypted_body = utils::read_message(&mut stream, &mut ingress_mac, &mut ingress_aes);
         if uncrypted_body.is_err() {
             println!("[{}@{}:{}] Time out", hex::encode(&remote_id), ip, port);
-            return Err(Errors::TimeOut(NodeId::new(&remote_id, &ip, port)));
+            return
         }
         let uncrypted_body = uncrypted_body.unwrap();
         
         if uncrypted_body[0] == 0x01 {
             // we have a disconnect message unfortunately
             println!("[{}@{}:{}] Disconnect {}", hex::encode(&remote_id), ip, port, hex::encode(uncrypted_body[1..].to_vec()));
-            return Err(Errors::Disconnect(NodeId::new(&remote_id, &ip, port), uncrypted_body[1]));
+            return
         }
         let network_id = message::parse_status_message(uncrypted_body[1..].to_vec());
     
-        println!("[{}@{}:{}] networkid = {}", hex::encode(&remote_id), ip, port, &network_id    );
+        println!("[{}@{}:{}] networkid = {}", hex::encode(&remote_id), ip, port, &network_id);
 
-        return Ok(NodeInfo { remote_id, network_id, capabilities});
-    })
-    .collect();
+        let cap : Vec<CapabilityMessage> = serde_json::from_str(&capabilities).unwrap();
+        let _result = postgres_client.execute(&update_statement, &[&(network_id as i64), &serde_json::to_value(&cap).unwrap(), &remote_id]).await.unwrap();
+    })).await;
 
     println!("Contacted all the nodes");
-
-    let update_statement = postgres_client.prepare("UPDATE discv4.nodes SET network_id = $1, capabilities = $2 WHERE id = $3;").unwrap();
-    let delete_statement = postgres_client.prepare("DELETE FROM discv4.nodes WHERE id = $1;").unwrap();
-
-    result.iter()
-        .for_each(|result| {
-            match result {
-                Ok(node) => {
-                    trieur.entry(node.network_id).and_modify(|counter| *counter += 1 ).or_insert(1);
-                    let cap : Vec<CapabilityMessage> = serde_json::from_str(&node.capabilities).unwrap();
-                    let _result = postgres_client.execute(&update_statement, &[&(node.network_id as i64), &serde_json::to_value(&cap).unwrap(), &node.remote_id]).unwrap();
-                },
-                Err(e) => {
-                    match e {
-                        Errors::Disconnect(..) => {
-                            disconnect_counter += 1;
-                        },
-                        Errors::EIP8Error(..) => {
-                            eip8_error_counter += 1;
-                        },
-                        Errors::TimeOut(..) => {
-                            timeout_counter += 1;
-                        },
-                        Errors::UnreachableNode(node) => {
-                            println!("remove IP");
-                            let _result = postgres_client.execute(&delete_statement, &[&node.id()]).unwrap();
-                        },
-                        Errors::UnreadablePayload(..) => {
-                            unreadable_payload_counter += 1;
-                        },
-                        Errors::UnknownError(..) => { }
-                    }
-                }
-            }
-                
-        });
-
-    dbg!(&trieur);
-    dbg!(&eip8_error_counter);
-    dbg!(&disconnect_counter);
-    dbg!(&timeout_counter);
-    dbg!(&unreadable_payload_counter);
-
-
 }
