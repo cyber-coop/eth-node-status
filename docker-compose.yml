@@ -1,0 +1,40 @@
+version: "3.9"
+
+services:
+  node-status:
+    build: .
+    networks:
+      - prototypes
+
+version: "3.9"
+
+services:
+  node-status:
+    build: .
+    depends_on:
+      - node-finder
+    volumes:
+      - ./config.toml:/config.toml
+
+  node-finder:
+    # I need to build an image for this https://github.com/cyber-coop/eth-node-finder
+    build: ../eth-node-finder
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./config.toml:/config.toml
+
+  postgres:
+    image: "postgres:latest"
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: blockchains
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: wow
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
