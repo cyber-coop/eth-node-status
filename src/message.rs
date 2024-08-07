@@ -71,6 +71,14 @@ pub fn parse_status_message(payload: Vec<u8>) -> u64 {
     // let blockhash: Vec<u8> = r.at(3).unwrap().as_val().unwrap();
     // let genesis: Vec<u8> = r.at(4).unwrap().as_val().unwrap();
 
+    // get forkid info
+    let forkidrlp = r.at(5).unwrap();
+    assert!(forkidrlp.is_list());
+    let fork_hash: Vec<u8> = forkidrlp.at(0).unwrap().as_val().unwrap();
+    let fork_next: u64 = forkidrlp.at(1).unwrap().as_val().unwrap();
+
+    dbg!((hex::encode(fork_hash), fork_next));
+
     return network_id;
 }
 

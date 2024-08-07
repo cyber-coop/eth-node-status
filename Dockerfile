@@ -1,12 +1,12 @@
 ##### BUILDER #####
-FROM rustlang/rust:nightly as builder
+FROM rust:latest as builder
 
 WORKDIR /usr/src/eth-node-status
 COPY . .
 RUN cargo install --path .
 
 ##### RUNNER #####
-FROM debian:buster-slim
+FROM debian:bookworm
 
 LABEL author="Lola Rigaut-Luczak <me@laflemme.lol>"
 LABEL description="Connect to a node and get the network id."

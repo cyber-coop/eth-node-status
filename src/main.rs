@@ -216,9 +216,12 @@ async fn main() {
     
         println!("[{}@{}:{}] Sending STATUS message", hex::encode(&remote_id), ip, port);
     
-        let genesis_hash = [212,229,103,64,248,118,174,248,192,16,184,106,64,213,245,103,69,161,24,208,144,106,52,230,154,236,140,13,177,203,143,163].to_vec();
+        let genesis_hash = [
+            212, 229, 103, 64, 248, 118, 174, 248, 192, 16, 184, 106, 64, 213, 245, 103, 69, 161,
+            24, 208, 144, 106, 52, 230, 154, 236, 140, 13, 177, 203, 143, 163,
+        ].to_vec();
         let head_td = 0;
-        let fork_id = [0xdce96c2d, 0].to_vec();
+        let fork_id = [0x9f3d2254, 0].to_vec();
         let network_id = 1;
     
         let status = message::create_status_message(&version, &genesis_hash, &genesis_hash, &head_td, &fork_id, &network_id);
